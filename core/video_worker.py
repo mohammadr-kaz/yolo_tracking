@@ -1,7 +1,5 @@
 import os
 import time
-import queue
-import threading
 
 import cv2
 import numpy as np
@@ -20,110 +18,28 @@ except Exception:
     torch = None
 
 
-class _FrameReader(threading.Thread):
-    """
-    Reads (and, per the current frame-skip setting, cheaply discards)
-    frames on its own thread, so decoding frame N+1 overlaps with the main
-    thread's detection on frame N instead of adding to it. Decode and
-    inference are genuinely independent costs that can run concurrently on
-    a multi-core CPU, which is the one place extra threading is worth it
-    here.
-
-    This does NOT change which frame gets analyzed or displayed: the main
-    loop still runs detection synchronously, on this thread's own output,
-    before showing it. It only hides I/O latency behind compute time - it
-    can never reintroduce a stale/lagging box.
-    """
-
-    def __init__(self, video_source, is_rtsp, max_reconnect_attempts,
-                 reconnect_delay_sec, get_skip_count, on_error):
-        super().__init__(daemon=True)
-        self.video_source = video_source
-        self.is_rtsp = is_rtsp
-        self.max_reconnect_attempts = max_reconnect_attempts
-        self.reconnect_delay_sec = reconnect_delay_sec
-        self.get_skip_count = get_skip_count
-        self.on_error = on_error
-
-        # Holds at most the single freshest frame: if the main thread
-        # hasn't consumed the previous one yet, it gets dropped rather
-        # than letting a backlog build up.
-        self.frame_queue = queue.Queue(maxsize=1)
-        self._stop_event = threading.Event()
-        self.opened_event = threading.Event()
-        self.failed_to_open = False
-
-    def stop(self):
-        self._stop_event.set()
-
-    def run(self):
-        cap = cv2.VideoCapture(self.video_source)
-
-        if not cap.isOpened():
-            self.failed_to_open = True
-            self.opened_event.set()
-            self.frame_queue.put(None)
-            return
-
-        self.opened_event.set()
-        consecutive_failures = 0
-
-        while not self._stop_event.is_set():
-            for _ in range(self.get_skip_count()):
-                if not cap.grab():
-                    break
-
-            ret, frame = cap.read()
-
-            if not ret:
-                if self.is_rtsp:
-                    consecutive_failures += 1
-                    if consecutive_failures > self.max_reconnect_attempts:
-                        self.on_error(
-                            f"Lost connection to the camera at {self.video_source} after "
-                            f"{self.max_reconnect_attempts} reconnect attempts.\n\n"
-                            "Verify the camera and PC are on the same subnet and that "
-                            "the camera is reachable, then try again."
-                        )
-                        break
-                    cap.release()
-                    time.sleep(self.reconnect_delay_sec)
-                    cap = cv2.VideoCapture(self.video_source)
-                    continue
-                else:
-                    break
-
-            consecutive_failures = 0
-
-            try:
-                self.frame_queue.get_nowait()
-            except queue.Empty:
-                pass
-            self.frame_queue.put(frame)
-
-        cap.release()
-        self.frame_queue.put(None)
-
-
 class VideoWorker(QThread):
     """
     Owns the video capture for the whole session (video file or RTSP
-    stream). It is created once per "Connect"; frame reading happens on a
-    _FrameReader helper thread that is started exactly once and kept
-    alive for the whole session - "Start Tracking"/"Stop Tracking" only
-    flip a flag read by this loop, so tracking always resumes from
-    whatever frame is currently playing instead of restarting the source
-    from frame 0.
+    stream). It is created once per "Connect" and opens the capture
+    exactly once - "Start Tracking"/"Stop Tracking" only flip a flag on
+    the already running loop, so tracking always resumes from whatever
+    frame is currently playing instead of restarting the source from
+    frame 0.
 
-    While tracking is on, detection runs synchronously on every frame this
-    loop pulls off the reader: the box drawn is always the real detector
-    output for that *exact* frame, never a cached or extrapolated guess,
-    so there is no synchronization gap between what is shown and what was
-    detected. Frame decoding for the *next* frame overlaps with detection
-    on the current one (see _FrameReader) to keep the frame rate up
-    without touching that guarantee - and "detect every N frames" skips
-    the frames in between cheaply (no decode) rather than showing them
-    with a stale box.
+    While tracking is on, detection runs synchronously on every frame that
+    gets displayed: the box drawn is always the real detector output for
+    that *exact* frame, never a cached or extrapolated guess, so there is
+    no synchronization gap between what is shown and what was detected.
+
+    To keep this fast without decoupling display from detection (which
+    would reintroduce a stale/lagging box), frames between detections are
+    discarded cheaply with cv2.VideoCapture.grab() - which advances the
+    stream without the costly decode step - instead of being fully read,
+    processed and shown. So raising "detect every N frames" trades a lower
+    displayed frame rate while tracking for a precise, up-to-the-instant
+    box on every frame that IS shown, rather than showing every frame at
+    full rate with a box that belongs to an older one.
     """
 
     frame_ready = pyqtSignal(np.ndarray)
@@ -186,9 +102,6 @@ class VideoWorker(QThread):
         self.tracking_enabled = enabled
         if not enabled:
             self.angles_ready.emit(0.0, 0.0)
-
-    def _get_skip_count(self):
-        return (self.detect_every_n_frames - 1) if self.tracking_enabled else 0
 
     def _ensure_model_loaded(self):
         """(Re)loads the model on this same thread, on demand, only when
@@ -281,25 +194,15 @@ class VideoWorker(QThread):
             self.error_signal.emit(f"Dataset capture failed: {e}")
 
     def run(self):
-        reader = None
         try:
             is_rtsp = isinstance(self.video_source, str) and self.video_source.startswith('rtsp')
 
             if is_rtsp:
                 os.environ['OPENCV_FFMPEG_CAPTURE_OPTIONS'] = 'rtsp_transport;tcp|stimeout;5000000'
 
-            reader = _FrameReader(
-                self.video_source, is_rtsp,
-                self.max_reconnect_attempts, self.reconnect_delay_sec,
-                get_skip_count=self._get_skip_count,
-                on_error=self.error_signal.emit,
-            )
-            reader.start()
-            if not reader.opened_event.wait(timeout=15.0):
-                self.error_signal.emit(f"Timed out opening video source: {self.video_source}")
-                return
+            cap = cv2.VideoCapture(self.video_source)
 
-            if reader.failed_to_open:
+            if not cap.isOpened():
                 if is_rtsp:
                     self.error_signal.emit(
                         f"Cannot open camera stream at {self.video_source}.\n\n"
@@ -315,19 +218,42 @@ class VideoWorker(QThread):
             self.running = True
 
             frame_id = 0
+            consecutive_failures = 0
             fps_smoothed = 0.0
             last_time = time.time()
 
             while self.running:
-                try:
-                    frame = reader.frame_queue.get(timeout=0.5)
-                except queue.Empty:
-                    continue
-
-                if frame is None:
-                    break  # stream ended, or a fatal error was already reported
-
                 is_tracking = self.tracking_enabled
+
+                if is_tracking:
+                    # Discard the in-between frames cheaply (grab() skips
+                    # the decode step) so the frame we actually read below
+                    # is as fresh as possible when we hand it to the model.
+                    for _ in range(self.detect_every_n_frames - 1):
+                        if not cap.grab():
+                            break
+
+                ret, frame = cap.read()
+
+                if not ret:
+                    if is_rtsp:
+                        consecutive_failures += 1
+                        if consecutive_failures > self.max_reconnect_attempts:
+                            self.error_signal.emit(
+                                f"Lost connection to the camera at {self.video_source} after "
+                                f"{self.max_reconnect_attempts} reconnect attempts.\n\n"
+                                "Verify the camera and PC are on the same subnet and that "
+                                "the camera is reachable, then try again."
+                            )
+                            break
+                        cap.release()
+                        self.msleep(int(self.reconnect_delay_sec * 1000))
+                        cap = cv2.VideoCapture(self.video_source)
+                        continue
+                    else:
+                        break
+
+                consecutive_failures = 0
                 frame_id += 1
                 h, w = frame.shape[:2]
 
@@ -364,12 +290,10 @@ class VideoWorker(QThread):
                 display_frame = self._resize_for_display(frame, self.display_width)
                 self.frame_ready.emit(display_frame)
 
+            cap.release()
+
         except Exception as e:
             self.error_signal.emit(f"Streaming error: {str(e)}")
-        finally:
-            if reader is not None:
-                reader.stop()
-                reader.join(timeout=2.0)
 
     def _draw_box_and_emit_angles(self, frame, box):
         x1, y1, x2, y2, conf, cls, label = box
