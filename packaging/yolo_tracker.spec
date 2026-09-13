@@ -44,7 +44,13 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    # This app only uses PyQt5. If any other Qt binding (PyQt6, PySide2,
+    # PySide6) happens to be installed in the build environment - often
+    # pulled in transitively by an unrelated package - PyInstaller's Qt
+    # hook auto-detects it and refuses to bundle two bindings at once.
+    # Excluding the others here avoids that, regardless of what else is
+    # installed alongside PyQt5.
+    excludes=['PyQt6', 'PySide2', 'PySide6', 'PySide'],
     noarchive=False,
     cipher=block_cipher,
 )
