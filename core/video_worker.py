@@ -177,8 +177,22 @@ class VideoWorker(QThread):
         self._imgsz = 640
         self._half = None
 
-        self._last_box = None
         self._last_saved_frame_id = -1
+
+        # Between-detection prediction state. A new detection only arrives
+        # every `detect_every_n_frames` frames (and can itself be slow), but
+        # every *displayed* frame still needs a box position. Freezing the
+        # box at its last-detected pixel position makes it visibly lag
+        # behind a moving target, so instead we keep a simple constant-
+        # velocity estimate and extrapolate the box to "now" on every
+        # displayed frame, correcting back to the real position whenever a
+        # new detection arrives. This is written from the inference thread
+        # and read from this thread's run() loop each frame; it is always
+        # replaced as a single new dict (never mutated in place), so a
+        # reader either sees the old, fully-consistent state or the new
+        # one, never a mix of the two.
+        self._track_state = None
+        self._max_extrapolation_sec = 1.0
 
         # Dataset capture (save frame + YOLO-format label above a
         # confidence threshold, into a user-chosen folder).
@@ -209,7 +223,7 @@ class VideoWorker(QThread):
                 self._inference.stop()
                 self._inference.join(timeout=1.0)
                 self._inference = None
-                self._last_box = None
+                self._track_state = None
 
             if self._inference is None:
                 self._inference = _InferenceWorker(
@@ -222,13 +236,70 @@ class VideoWorker(QThread):
 
         self.tracking_enabled = enabled
         if not enabled:
-            self._last_box = None
+            self._track_state = None
             self.angles_ready.emit(0.0, 0.0)
 
     def _on_inference_result(self, frame_id, frame, box):
-        self._last_box = box
-        if box is not None:
-            self._maybe_save_dataset_sample(frame, box, frame_id)
+        if box is None:
+            # Nothing detected this cycle - keep predicting from the last
+            # known velocity for a short grace period rather than blanking
+            # the box on a single missed detection (see _get_predicted_box,
+            # which drops the track once the prediction gets too stale).
+            return
+
+        now = time.time()
+        x1, y1, x2, y2, conf, cls, label = box
+        cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+        w, h = x2 - x1, y2 - y1
+
+        prev = self._track_state
+        velocity = (0.0, 0.0)
+        if prev is not None:
+            dt = now - prev["time"]
+            if dt > 1e-3:
+                raw_vx = (cx - prev["center"][0]) / dt
+                raw_vy = (cy - prev["center"][1]) / dt
+                # Smooth the velocity estimate so per-detection jitter
+                # doesn't make the predicted box shake between updates.
+                alpha = 0.5
+                prev_vx, prev_vy = prev["velocity"]
+                velocity = (alpha * raw_vx + (1 - alpha) * prev_vx,
+                            alpha * raw_vy + (1 - alpha) * prev_vy)
+
+        self._track_state = {
+            "center": (cx, cy),
+            "size": (w, h),
+            "velocity": velocity,
+            "time": now,
+            "conf": conf,
+            "cls": cls,
+            "label": label,
+        }
+
+        self._maybe_save_dataset_sample(frame, box, frame_id)
+
+    def _get_predicted_box(self, frame_w, frame_h):
+        state = self._track_state
+        if state is None:
+            return None
+
+        age = time.time() - state["time"]
+        if age > self._max_extrapolation_sec:
+            return None
+
+        cx, cy = state["center"]
+        vx, vy = state["velocity"]
+        pred_cx = cx + vx * age
+        pred_cy = cy + vy * age
+        # A single bad detection can produce a wild velocity spike; clamp
+        # the extrapolated center to the frame so it can't fly off-screen.
+        pred_cx = min(max(pred_cx, 0.0), frame_w)
+        pred_cy = min(max(pred_cy, 0.0), frame_h)
+        w, h = state["size"]
+
+        x1, y1 = pred_cx - w / 2, pred_cy - h / 2
+        x2, y2 = pred_cx + w / 2, pred_cy + h / 2
+        return (x1, y1, x2, y2, state["conf"], state["cls"], state["label"])
 
     def _maybe_save_dataset_sample(self, frame, box, frame_id):
         if not (self.dataset_capture_enabled and self.dataset_dir):
@@ -313,16 +384,16 @@ class VideoWorker(QThread):
 
                 consecutive_failures = 0
                 frame_id += 1
+                h, w = frame.shape[:2]
 
                 if self.tracking_enabled and self._inference is not None:
                     if frame_id % self.detect_every_n_frames == 0:
                         self._inference.submit(frame.copy(), frame_id)
 
-                    box = self._last_box
+                    box = self._get_predicted_box(w, h)
                     if box is not None:
                         self._draw_box_and_emit_angles(frame, box)
 
-                h, w = frame.shape[:2]
                 cv2.line(frame, (w // 2, 0), (w // 2, h), (0, 255, 255), 1)
                 cv2.line(frame, (0, h // 2), (w, h // 2), (0, 255, 255), 1)
 
