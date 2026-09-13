@@ -138,9 +138,11 @@ class MainWindow(QMainWindow):
         perf_layout.addWidget(QLabel("Run detection every N frames (skip N-1 for speed):"))
         perf_layout.addWidget(self.detect_n_spin)
 
-        perf_hint = QLabel("The video display always runs at the source's own frame rate; "
-                            "detection runs independently and never blocks it, so raising "
-                            "these values only affects how fresh the tracking box is.")
+        perf_hint = QLabel("Every displayed frame while tracking shows its own exact, "
+                            "just-computed box - never a stale or predicted one. Raising "
+                            "'detect every N frames' skips the frames in between at low "
+                            "cost, trading a lower frame rate while tracking for a box "
+                            "that's always precisely in sync with what's shown.")
         perf_hint.setStyleSheet("color: #888; font-size: 9pt;")
         perf_hint.setWordWrap(True)
         perf_layout.addWidget(perf_hint)

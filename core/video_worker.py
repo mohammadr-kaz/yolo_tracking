@@ -1,6 +1,5 @@
 import os
 import time
-import threading
 
 import cv2
 import numpy as np
@@ -19,132 +18,28 @@ except Exception:
     torch = None
 
 
-class _InferenceWorker(threading.Thread):
-    """
-    Runs YOLO inference on its own plain (non-Qt) thread so a slow model
-    never blocks frame capture/display.
-
-    Only the single most recently submitted frame is ever processed (a
-    one-slot "mailbox", not a queue): if the model is slower than the
-    camera, older frames are simply dropped instead of backing up, which is
-    what keeps the displayed video real-time while tracking is on.
-    """
-
-    def __init__(self, model_path, device, imgsz, half, on_result, on_error):
-        super().__init__(daemon=True)
-        self.model_path = model_path
-        self.device = device
-        self.imgsz = imgsz
-        self.half = half
-        self.on_result = on_result
-        self.on_error = on_error
-
-        self.resolved_device = None
-        self.effective_half = None
-
-        self._lock = threading.Lock()
-        self._pending_frame = None
-        self._pending_id = -1
-        self._new_frame_event = threading.Event()
-        self._stop_event = threading.Event()
-        self._ready_event = threading.Event()
-        self._model = None
-
-    def submit(self, frame, frame_id):
-        with self._lock:
-            self._pending_frame = frame
-            self._pending_id = frame_id
-        self._new_frame_event.set()
-
-    def wait_until_ready(self, timeout=None):
-        return self._ready_event.wait(timeout)
-
-    def stop(self):
-        self._stop_event.set()
-        self._new_frame_event.set()
-
-    def _resolve_device(self):
-        cuda_available = bool(torch and torch.cuda.is_available())
-
-        if self.device in (None, "auto", "Auto"):
-            resolved = "cuda:0" if cuda_available else "cpu"
-        elif str(self.device).lower() == "cpu":
-            resolved = "cpu"
-        else:
-            if not cuda_available:
-                raise RuntimeError(
-                    "GPU (CUDA) was requested but PyTorch did not detect a CUDA-capable "
-                    "GPU/driver on this machine. Install a CUDA-enabled PyTorch build, or "
-                    "set Device to 'Auto' or 'CPU'."
-                )
-            resolved = self.device
-
-        effective_half = self.half if self.half is not None else cuda_available
-        # Half precision on CPU (in particular for ONNX-on-CPU) is not
-        # supported/useful - always force it off there.
-        if resolved == "cpu":
-            effective_half = False
-
-        return resolved, effective_half
-
-    def run(self):
-        try:
-            self.resolved_device, self.effective_half = self._resolve_device()
-            self._model = YOLO(self.model_path)
-            print(f"[InferenceWorker] model={self.model_path} device={self.resolved_device} "
-                  f"half={self.effective_half} imgsz={self.imgsz}")
-            self._ready_event.set()
-        except Exception as e:
-            self.on_error(f"Failed to load model: {e}")
-            self._ready_event.set()
-            return
-
-        while not self._stop_event.is_set():
-            self._new_frame_event.wait()
-            self._new_frame_event.clear()
-            if self._stop_event.is_set():
-                break
-
-            with self._lock:
-                frame = self._pending_frame
-                frame_id = self._pending_id
-                self._pending_frame = None
-
-            if frame is None:
-                continue
-
-            try:
-                results = self._model(frame, device=self.resolved_device, half=self.effective_half,
-                                       imgsz=self.imgsz, verbose=False)
-                box = self._extract_best_box(results, self._model)
-                self.on_result(frame_id, frame, box)
-            except Exception as e:
-                self.on_error(f"Detection error: {e}")
-
-    @staticmethod
-    def _extract_best_box(results, model):
-        for result in results:
-            boxes = result.boxes
-            if len(boxes) > 0:
-                box = boxes[0]
-                x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
-                conf = float(box.conf[0].cpu().numpy())
-                cls = int(box.cls[0].cpu().numpy())
-                label = f"{model.names[cls]} {conf:.2f}"
-                return (float(x1), float(y1), float(x2), float(y2), conf, cls, label)
-        return None
-
-
 class VideoWorker(QThread):
     """
     Owns the video capture for the whole session (video file or RTSP
-    stream). It is created once per "Connect" and opens the capture exactly
-    once - "Start Tracking"/"Stop Tracking" only flip a flag on the already
-    running loop, so tracking always resumes from whatever frame is
-    currently playing instead of restarting the source from frame 0.
+    stream). It is created once per "Connect" and opens the capture
+    exactly once - "Start Tracking"/"Stop Tracking" only flip a flag on
+    the already running loop, so tracking always resumes from whatever
+    frame is currently playing instead of restarting the source from
+    frame 0.
 
-    Detection runs on a second, decoupled thread (see _InferenceWorker) so
-    a slow model degrades detection latency, not the displayed frame rate.
+    While tracking is on, detection runs synchronously on every frame that
+    gets displayed: the box drawn is always the real detector output for
+    that *exact* frame, never a cached or extrapolated guess, so there is
+    no synchronization gap between what is shown and what was detected.
+
+    To keep this fast without decoupling display from detection (which
+    would reintroduce a stale/lagging box), frames between detections are
+    discarded cheaply with cv2.VideoCapture.grab() - which advances the
+    stream without the costly decode step - instead of being fully read,
+    processed and shown. So raising "detect every N frames" trades a lower
+    displayed frame rate while tracking for a precise, up-to-the-instant
+    box on every frame that IS shown, rather than showing every frame at
+    full rate with a box that belongs to an older one.
     """
 
     frame_ready = pyqtSignal(np.ndarray)
@@ -170,29 +65,16 @@ class VideoWorker(QThread):
         self.tracking_enabled = False
         self.detect_every_n_frames = 1
 
-        self._inference = None
-        self._inference_key = None
+        self._model = None
+        self._model_key = None
         self._model_path = None
         self._device = None
         self._imgsz = 640
         self._half = None
+        self._resolved_device = None
+        self._effective_half = None
 
         self._last_saved_frame_id = -1
-
-        # Between-detection prediction state. A new detection only arrives
-        # every `detect_every_n_frames` frames (and can itself be slow), but
-        # every *displayed* frame still needs a box position. Freezing the
-        # box at its last-detected pixel position makes it visibly lag
-        # behind a moving target, so instead we keep a simple constant-
-        # velocity estimate and extrapolate the box to "now" on every
-        # displayed frame, correcting back to the real position whenever a
-        # new detection arrives. This is written from the inference thread
-        # and read from this thread's run() loop each frame; it is always
-        # replaced as a single new dict (never mutated in place), so a
-        # reader either sees the old, fully-consistent state or the new
-        # one, never a mix of the two.
-        self._track_state = None
-        self._max_extrapolation_sec = 1.0
 
         # Dataset capture (save frame + YOLO-format label above a
         # confidence threshold, into a user-chosen folder).
@@ -213,93 +95,72 @@ class VideoWorker(QThread):
         self.dataset_conf_threshold = max(0.0, min(100.0, conf_threshold_pct)) / 100.0
 
     def set_tracking_enabled(self, enabled):
-        if enabled:
-            if not self._model_path:
-                self.error_signal.emit("Please provide a model path before starting tracking")
-                return
-
-            key = (self._model_path, self._device, self._imgsz, self._half)
-            if self._inference is not None and self._inference_key != key:
-                self._inference.stop()
-                self._inference.join(timeout=1.0)
-                self._inference = None
-                self._track_state = None
-
-            if self._inference is None:
-                self._inference = _InferenceWorker(
-                    self._model_path, self._device, self._imgsz, self._half,
-                    on_result=self._on_inference_result,
-                    on_error=self.error_signal.emit,
-                )
-                self._inference_key = key
-                self._inference.start()
+        if enabled and not self._model_path:
+            self.error_signal.emit("Please provide a model path before starting tracking")
+            return
 
         self.tracking_enabled = enabled
         if not enabled:
-            self._track_state = None
             self.angles_ready.emit(0.0, 0.0)
 
-    def _on_inference_result(self, frame_id, frame, box):
-        if box is None:
-            # Nothing detected this cycle - keep predicting from the last
-            # known velocity for a short grace period rather than blanking
-            # the box on a single missed detection (see _get_predicted_box,
-            # which drops the track once the prediction gets too stale).
-            return
+    def _ensure_model_loaded(self):
+        """(Re)loads the model on this same thread, on demand, only when
+        the model/device/imgsz/half configuration actually changed."""
+        key = (self._model_path, self._device, self._imgsz, self._half)
+        if self._model is not None and self._model_key == key:
+            return True
 
-        now = time.time()
-        x1, y1, x2, y2, conf, cls, label = box
-        cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
-        w, h = x2 - x1, y2 - y1
+        try:
+            self._resolved_device, self._effective_half = self._resolve_device()
+            self._model = YOLO(self._model_path)
+            self._model_key = key
+            print(f"[VideoWorker] model={self._model_path} device={self._resolved_device} "
+                  f"half={self._effective_half} imgsz={self._imgsz}")
+            return True
+        except Exception as e:
+            self.error_signal.emit(f"Failed to load model: {e}")
+            self._model = None
+            self._model_key = None
+            self.tracking_enabled = False
+            return False
 
-        prev = self._track_state
-        velocity = (0.0, 0.0)
-        if prev is not None:
-            dt = now - prev["time"]
-            if dt > 1e-3:
-                raw_vx = (cx - prev["center"][0]) / dt
-                raw_vy = (cy - prev["center"][1]) / dt
-                # Smooth the velocity estimate so per-detection jitter
-                # doesn't make the predicted box shake between updates.
-                alpha = 0.5
-                prev_vx, prev_vy = prev["velocity"]
-                velocity = (alpha * raw_vx + (1 - alpha) * prev_vx,
-                            alpha * raw_vy + (1 - alpha) * prev_vy)
+    def _resolve_device(self):
+        cuda_available = bool(torch and torch.cuda.is_available())
 
-        self._track_state = {
-            "center": (cx, cy),
-            "size": (w, h),
-            "velocity": velocity,
-            "time": now,
-            "conf": conf,
-            "cls": cls,
-            "label": label,
-        }
+        if self._device in (None, "auto", "Auto"):
+            resolved = "cuda:0" if cuda_available else "cpu"
+        elif str(self._device).lower() == "cpu":
+            resolved = "cpu"
+        else:
+            if not cuda_available:
+                raise RuntimeError(
+                    "GPU (CUDA) was requested but PyTorch did not detect a CUDA-capable "
+                    "GPU/driver on this machine. Install a CUDA-enabled PyTorch build, or "
+                    "set Device to 'Auto' or 'CPU'."
+                )
+            resolved = self._device
 
-        self._maybe_save_dataset_sample(frame, box, frame_id)
+        effective_half = self._half if self._half is not None else cuda_available
+        # Half precision on CPU (in particular for ONNX-on-CPU) is not
+        # supported/useful - always force it off there.
+        if resolved == "cpu":
+            effective_half = False
 
-    def _get_predicted_box(self, frame_w, frame_h):
-        state = self._track_state
-        if state is None:
-            return None
+        return resolved, effective_half
 
-        age = time.time() - state["time"]
-        if age > self._max_extrapolation_sec:
-            return None
-
-        cx, cy = state["center"]
-        vx, vy = state["velocity"]
-        pred_cx = cx + vx * age
-        pred_cy = cy + vy * age
-        # A single bad detection can produce a wild velocity spike; clamp
-        # the extrapolated center to the frame so it can't fly off-screen.
-        pred_cx = min(max(pred_cx, 0.0), frame_w)
-        pred_cy = min(max(pred_cy, 0.0), frame_h)
-        w, h = state["size"]
-
-        x1, y1 = pred_cx - w / 2, pred_cy - h / 2
-        x2, y2 = pred_cx + w / 2, pred_cy + h / 2
-        return (x1, y1, x2, y2, state["conf"], state["cls"], state["label"])
+    def _detect_best_box(self, frame):
+        results = self._model(frame, device=self._resolved_device, half=self._effective_half,
+                               imgsz=self._imgsz, verbose=False)
+        for result in results:
+            boxes = result.boxes
+            if len(boxes) > 0:
+                box = boxes[0]
+                x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+                conf = float(box.conf[0].cpu().numpy())
+                cls = int(box.cls[0].cpu().numpy())
+                label = f"{self._model.names[cls]} {conf:.2f}"
+                return (float(x1), float(y1), float(x2), float(y2), conf, cls, label)
+        return None
 
     def _maybe_save_dataset_sample(self, frame, box, frame_id):
         if not (self.dataset_capture_enabled and self.dataset_dir):
@@ -362,6 +223,16 @@ class VideoWorker(QThread):
             last_time = time.time()
 
             while self.running:
+                is_tracking = self.tracking_enabled
+
+                if is_tracking:
+                    # Discard the in-between frames cheaply (grab() skips
+                    # the decode step) so the frame we actually read below
+                    # is as fresh as possible when we hand it to the model.
+                    for _ in range(self.detect_every_n_frames - 1):
+                        if not cap.grab():
+                            break
+
                 ret, frame = cap.read()
 
                 if not ret:
@@ -386,13 +257,18 @@ class VideoWorker(QThread):
                 frame_id += 1
                 h, w = frame.shape[:2]
 
-                if self.tracking_enabled and self._inference is not None:
-                    if frame_id % self.detect_every_n_frames == 0:
-                        self._inference.submit(frame.copy(), frame_id)
+                if is_tracking and self._ensure_model_loaded():
+                    try:
+                        box = self._detect_best_box(frame)
+                    except Exception as e:
+                        self.error_signal.emit(f"Detection error: {e}")
+                        box = None
 
-                    box = self._get_predicted_box(w, h)
                     if box is not None:
                         self._draw_box_and_emit_angles(frame, box)
+                        self._maybe_save_dataset_sample(frame, box, frame_id)
+                    else:
+                        self.angles_ready.emit(0.0, 0.0)
 
                 cv2.line(frame, (w // 2, 0), (w // 2, h), (0, 255, 255), 1)
                 cv2.line(frame, (0, h // 2), (w, h // 2), (0, 255, 255), 1)
@@ -404,8 +280,8 @@ class VideoWorker(QThread):
                     instant_fps = 1.0 / dt
                     fps_smoothed = instant_fps if fps_smoothed == 0 else (0.9 * fps_smoothed + 0.1 * instant_fps)
 
-                status = "TRACKING" if self.tracking_enabled else "STREAMING (no detection)"
-                color = (0, 255, 0) if self.tracking_enabled else (60, 170, 220)
+                status = "TRACKING" if is_tracking else "STREAMING (no detection)"
+                color = (0, 255, 0) if is_tracking else (60, 170, 220)
                 cv2.putText(frame, f"FPS: {fps_smoothed:.1f}  [{status}]", (10, h - 15),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
                 if frame_id % 10 == 0:
@@ -415,9 +291,6 @@ class VideoWorker(QThread):
                 self.frame_ready.emit(display_frame)
 
             cap.release()
-            if self._inference is not None:
-                self._inference.stop()
-                self._inference.join(timeout=2.0)
 
         except Exception as e:
             self.error_signal.emit(f"Streaming error: {str(e)}")
